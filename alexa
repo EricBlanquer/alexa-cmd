@@ -1,30 +1,43 @@
 #!/usr/bin/env python3
 """alexa-cmd: Send text commands to Alexa devices via command line.
 
-Uses Amazon's Alexa web API with cookie-based authentication.
+Reads session cookies live from Firefox (~/.mozilla/firefox/<profile>/cookies.sqlite).
+On missing/expired session, opens Firefox to the Alexa login page and polls until
+the user is authenticated.
 
 Usage:
-    alexa setup                              # First-time auth setup
-    alexa devices                            # List devices
-    alexa default <name>                     # Set default device
-    alexa send allume la lumiere             # Send text command
-    alexa send -d echo eteins la lumiere     # Send to specific device
-    alexa say bonjour tout le monde          # Text-to-speech
+    alexa allume la lumiere                  # send command (default)
+    alexa -d echo eteins la lumiere          # target specific device
+    alexa say bonjour tout le monde          # text-to-speech
+    alexa devices                            # list devices
+    alexa default echo                       # set default device
+    alexa setup                              # force re-auth + show devices
 """
 
 import argparse
+import configparser
 import json
+import shutil
+import sqlite3
+import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 import requests
 
 CONFIG_DIR = Path.home() / ".config" / "alexa-cmd"
-COOKIE_FILE = CONFIG_DIR / "cookies.txt"
 DEVICES_FILE = CONFIG_DIR / "devices.json"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
+FIREFOX_DIR = Path.home() / ".mozilla" / "firefox"
 ALEXA_URL = "https://alexa.amazon.fr"
+DEVICES_PATH = "/api/devices-v2/device"
+LOGIN_TIMEOUT_SEC = 300
+POLL_INTERVAL_SEC = 2
+
+KNOWN_COMMANDS = {"setup", "devices", "default", "send", "say"}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -47,40 +60,151 @@ def save_config(config):
     CONFIG_FILE.write_text(json.dumps(config, indent=2))
 
 
-def build_session():
-    if not COOKIE_FILE.exists():
-        print("Pas de cookies. Lance 'alexa setup' d'abord.", file=sys.stderr)
-        sys.exit(1)
+def find_firefox_profile():
+    profiles_ini = FIREFOX_DIR / "profiles.ini"
+    if not profiles_ini.exists():
+        return None
+    cp = configparser.ConfigParser()
+    cp.read(profiles_ini)
+    for section in cp.sections():
+        if section.startswith("Install"):
+            default = cp[section].get("Default")
+            if default:
+                path = FIREFOX_DIR / default
+                if path.exists():
+                    return path
+    for section in cp.sections():
+        if section.startswith("Profile") and cp[section].get("Default") == "1":
+            rel = cp[section].get("Path")
+            if rel:
+                path = FIREFOX_DIR / rel
+                if path.exists():
+                    return path
+    return None
 
+
+def require_firefox_profile():
+    profile = find_firefox_profile()
+    if not profile:
+        print("Profil Firefox introuvable dans ~/.mozilla/firefox/.", file=sys.stderr)
+        sys.exit(1)
+    return profile
+
+
+def read_firefox_cookies(profile):
+    src = profile / "cookies.sqlite"
+    if not src.exists():
+        return {}
+    with tempfile.TemporaryDirectory(prefix="alexa-cookies-") as tmp:
+        tmp_dir = Path(tmp)
+        for ext in ("", "-wal", "-shm"):
+            f = profile / f"cookies.sqlite{ext}"
+            if f.exists():
+                try:
+                    shutil.copy2(f, tmp_dir / f.name)
+                except OSError:
+                    pass
+        copied = tmp_dir / "cookies.sqlite"
+        if not copied.exists():
+            return {}
+        try:
+            conn = sqlite3.connect(f"file:{copied}?mode=ro", uri=True, timeout=5.0)
+        except sqlite3.Error:
+            return {}
+        try:
+            cur = conn.execute(
+                "SELECT name, value FROM moz_cookies "
+                "WHERE host LIKE '%amazon.fr' "
+                "AND (originAttributes = '' OR originAttributes IS NULL) "
+                "ORDER BY lastAccessed DESC, expiry DESC"
+            )
+            cookies = {}
+            for name, value in cur:
+                cookies.setdefault(name, value)
+            return cookies
+        except sqlite3.Error:
+            return {}
+        finally:
+            conn.close()
+
+
+def make_session(cookies):
     session = requests.Session()
     session.headers.update(HEADERS)
-
-    cookie_str = COOKIE_FILE.read_text().strip()
-    for pair in cookie_str.split(";"):
-        pair = pair.strip()
-        if "=" in pair:
-            name, _, value = pair.partition("=")
-            session.cookies.set(name.strip(), value.strip())
-
-    csrf = session.cookies.get("csrf")
+    for name, value in cookies.items():
+        session.cookies.set(name, value)
+    csrf = cookies.get("csrf")
     if csrf:
         session.headers["csrf"] = csrf
-
     return session
 
 
-def check_response(resp):
-    if resp.status_code == 401:
-        print("Session expiree. Relance 'alexa setup'.", file=sys.stderr)
+def cookies_look_complete(cookies):
+    return "session-token" in cookies and "csrf" in cookies
+
+
+def cookies_are_valid(cookies):
+    if not cookies_look_complete(cookies):
+        return False
+    session = make_session(cookies)
+    try:
+        resp = session.get(ALEXA_URL + DEVICES_PATH, timeout=10, allow_redirects=False)
+    except requests.RequestException:
+        return False
+    return resp.status_code == 200
+
+
+def auto_login(profile):
+    cookies = read_firefox_cookies(profile)
+    if cookies_are_valid(cookies):
+        return cookies
+
+    print("Authentification requise. Ouverture de Firefox...", file=sys.stderr)
+    try:
+        subprocess.Popen(
+            ["firefox", ALEXA_URL + DEVICES_PATH],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        print("Firefox introuvable dans le PATH.", file=sys.stderr)
         sys.exit(1)
+
+    print(
+        f"Connecte-toi a Amazon dans Firefox (timeout {LOGIN_TIMEOUT_SEC}s)...",
+        file=sys.stderr,
+    )
+    deadline = time.time() + LOGIN_TIMEOUT_SEC
+    while time.time() < deadline:
+        time.sleep(POLL_INTERVAL_SEC)
+        cookies = read_firefox_cookies(profile)
+        if cookies_are_valid(cookies):
+            print("Connexion etablie.", file=sys.stderr)
+            return cookies
+
+    print("Timeout d'authentification.", file=sys.stderr)
+    sys.exit(1)
+
+
+def authed_request(call):
+    profile = require_firefox_profile()
+    cookies = read_firefox_cookies(profile)
+    if not cookies_look_complete(cookies):
+        cookies = auto_login(profile)
+    session = make_session(cookies)
+    resp = call(session)
+    if resp.status_code in (302, 401):
+        cookies = auto_login(profile)
+        session = make_session(cookies)
+        resp = call(session)
     resp.raise_for_status()
+    return resp
 
 
 def fetch_devices():
-    session = build_session()
-    resp = session.get(ALEXA_URL + "/api/devices-v2/device")
-    check_response(resp)
-
+    resp = authed_request(
+        lambda s: s.get(ALEXA_URL + DEVICES_PATH, allow_redirects=False)
+    )
     data = resp.json()
     devices = []
     customer_id = None
@@ -147,7 +271,7 @@ def find_device(name=None):
     return devices[0]
 
 
-def send_behavior(session, behavior_type, payload, device):
+def send_behavior(behavior_type, payload, device):
     config = load_config()
     customer_id = config.get("customer_id", "")
 
@@ -170,43 +294,23 @@ def send_behavior(session, behavior_type, payload, device):
         "status": "ENABLED",
     }
 
-    resp = session.post(ALEXA_URL + "/api/behaviors/preview", json=body)
-    check_response(resp)
-    return resp
+    return authed_request(
+        lambda s: s.post(ALEXA_URL + "/api/behaviors/preview", json=body,
+                         allow_redirects=False)
+    )
 
 
 # ── Commands ──────────────────────────────────────────────────────────
 
 def cmd_setup(_args):
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-
-    print("=== Configuration alexa-cmd ===\n")
-    print("1. Ouvre https://alexa.amazon.fr/api/devices-v2/device dans ton navigateur")
-    print("   (tu seras redirige vers le login Amazon, connecte-toi)")
-    print("2. Apres login, tu verras du JSON : les appareils sont detectes")
-    print("3. Ouvre DevTools (F12) > onglet Network (Reseau)")
-    print("4. Rafraichis la page (F5)")
-    print("5. Clique sur la requete 'device'")
-    print("6. Dans Request Headers, copie la valeur complete du header 'Cookie'")
-    print("7. Colle-la ci-dessous :\n")
-
-    cookie_str = input("Cookie: ").strip()
-    if not cookie_str:
-        print("Aucun cookie fourni.", file=sys.stderr)
+    profile = require_firefox_profile()
+    cookies = auto_login(profile)
+    if not cookies_are_valid(cookies):
+        print("Cookies invalides apres login.", file=sys.stderr)
         sys.exit(1)
 
-    COOKIE_FILE.write_text(cookie_str)
-    COOKIE_FILE.chmod(0o600)
-    print(f"\nCookies sauvegardes dans {COOKIE_FILE}")
-
-    print("\nVerification...")
-    try:
-        devices = fetch_devices()
-    except Exception as ex:
-        print(f"Erreur : {ex}", file=sys.stderr)
-        print("Verifie que les cookies sont corrects.", file=sys.stderr)
-        sys.exit(1)
-
+    print("Recuperation des appareils...")
+    devices = fetch_devices()
     if not devices:
         print("Aucun appareil interactif trouve.")
         return
@@ -216,10 +320,11 @@ def cmd_setup(_args):
         print(f"  {i}. {d['name']} ({d['family']})")
 
     config = load_config()
-    config["default_device"] = devices[0]["name"]
-    save_config(config)
-    print(f"\nAppareil par defaut : {devices[0]['name']}")
-    print("Change avec : alexa default <nom>")
+    if not config.get("default_device"):
+        config["default_device"] = devices[0]["name"]
+        save_config(config)
+        print(f"\nAppareil par defaut : {devices[0]['name']}")
+        print("Change avec : alexa default <nom>")
 
 
 def cmd_devices(_args):
@@ -264,8 +369,7 @@ def cmd_send(args):
         sys.exit(1)
 
     device = find_device(args.device)
-    session = build_session()
-    resp = send_behavior(session, "Alexa.TextCommand", {"text": text}, device)
+    resp = send_behavior("Alexa.TextCommand", {"text": text}, device)
 
     if resp.status_code == 200:
         print(f"-> {device['name']} : {text}")
@@ -281,8 +385,7 @@ def cmd_say(args):
         sys.exit(1)
 
     device = find_device(args.device)
-    session = build_session()
-    resp = send_behavior(session, "Alexa.Speak", {"textToSpeak": text}, device)
+    resp = send_behavior("Alexa.Speak", {"textToSpeak": text}, device)
 
     if resp.status_code == 200:
         print(f">> {device['name']} : {text}")
@@ -292,19 +395,24 @@ def cmd_say(args):
 
 
 def main():
+    if len(sys.argv) > 1:
+        first = sys.argv[1]
+        if first not in KNOWN_COMMANDS and first not in ("-h", "--help"):
+            sys.argv.insert(1, "send")
+
     parser = argparse.ArgumentParser(
         prog="alexa",
         description="Envoie des commandes texte a Alexa depuis le terminal",
     )
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("setup", help="Configurer l'authentification")
+    sub.add_parser("setup", help="Re-authentifier et lister les appareils")
     sub.add_parser("devices", help="Lister les appareils Alexa")
 
     p_def = sub.add_parser("default", help="Definir l'appareil par defaut")
     p_def.add_argument("name", nargs="+", help="Nom de l'appareil (correspondance partielle)")
 
-    p_send = sub.add_parser("send", help="Envoyer une commande texte")
+    p_send = sub.add_parser("send", help="Envoyer une commande texte (par defaut)")
     p_send.add_argument("text", nargs="+", help="Commande a envoyer")
     p_send.add_argument("-d", "--device", help="Appareil cible (correspondance partielle)")
 
