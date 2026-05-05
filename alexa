@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
 """alexa-cmd: Send text commands to Alexa devices via command line.
 
-Reads session cookies live from Firefox (~/.mozilla/firefox/<profile>/cookies.sqlite).
-On missing/expired session, opens Firefox to the Alexa login page and polls until
-the user is authenticated.
-
-Usage:
-    alexa allume la lumiere                  # send command (default)
-    alexa -d echo eteins la lumiere          # target specific device
-    alexa say bonjour tout le monde          # text-to-speech
-    alexa devices                            # list devices
-    alexa default echo                       # set default device
-    alexa setup                              # force re-auth + show devices
+Detects the default web browser (Firefox / Chrome / Chromium / Brave) and reads
+its session cookies live from disk. On missing/expired session, opens that
+browser to the Alexa login page and polls until the user is authenticated.
 """
 
 import argparse
 import configparser
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -38,6 +31,27 @@ LOGIN_TIMEOUT_SEC = 300
 POLL_INTERVAL_SEC = 2
 
 KNOWN_COMMANDS = {"setup", "devices", "default", "send", "say"}
+
+CHROMIUM_BROWSERS = {
+    "chrome": {
+        "label": "Chrome",
+        "commands": ["google-chrome", "google-chrome-stable"],
+        "db": Path.home() / ".config/google-chrome/Default/Cookies",
+        "keyring": "chrome",
+    },
+    "chromium": {
+        "label": "Chromium",
+        "commands": ["chromium", "chromium-browser"],
+        "db": Path.home() / ".config/chromium/Default/Cookies",
+        "keyring": "chromium",
+    },
+    "brave": {
+        "label": "Brave",
+        "commands": ["brave-browser", "brave"],
+        "db": Path.home() / ".config/BraveSoftware/Brave-Browser/Default/Cookies",
+        "keyring": "brave",
+    },
+}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -83,12 +97,85 @@ def find_firefox_profile():
     return None
 
 
-def require_firefox_profile():
-    profile = find_firefox_profile()
-    if not profile:
-        print("Profil Firefox introuvable dans ~/.mozilla/firefox/.", file=sys.stderr)
+def first_in_path(commands):
+    for cmd in commands:
+        if shutil.which(cmd):
+            return cmd
+    return None
+
+
+def detect_default_browser_id():
+    try:
+        out = subprocess.check_output(
+            ["xdg-settings", "get", "default-web-browser"],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).decode().strip().lower()
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    if "firefox" in out:
+        return "firefox"
+    if "chromium" in out:
+        return "chromium"
+    if "brave" in out:
+        return "brave"
+    if "chrome" in out:
+        return "chrome"
+    return None
+
+
+def build_browser_info(browser_id):
+    if browser_id == "firefox":
+        profile = find_firefox_profile()
+        cmd = first_in_path(["firefox", "firefox-esr"])
+        if not profile or not cmd:
+            return None
+        return {"id": "firefox", "type": "firefox", "label": "Firefox",
+                "command": cmd, "profile": profile}
+    cfg = CHROMIUM_BROWSERS.get(browser_id)
+    if not cfg or not cfg["db"].exists():
+        return None
+    cmd = first_in_path(cfg["commands"])
+    if not cmd:
+        return None
+    return {"id": browser_id, "type": "chromium", "label": cfg["label"],
+            "command": cmd, "db": cfg["db"], "keyring": cfg["keyring"]}
+
+
+def browser_has_readable_amazon_cookies(browser):
+    if browser["type"] == "firefox":
+        return True
+    cookies = read_chromium_cookies(browser)
+    return any(name in cookies for name in ("session-id", "ubid-acbfr", "session-token"))
+
+
+def find_browser():
+    candidates = []
+    detected = detect_default_browser_id()
+    if detected:
+        candidates.append(detected)
+    for bid in ("firefox", "chrome", "chromium", "brave"):
+        if bid not in candidates:
+            candidates.append(bid)
+    fallback = None
+    for bid in candidates:
+        info = build_browser_info(bid)
+        if not info:
+            continue
+        if browser_has_readable_amazon_cookies(info):
+            return info
+        if fallback is None:
+            fallback = info
+    return fallback
+
+
+def require_browser():
+    info = find_browser()
+    if not info:
+        print("Aucun navigateur supporte trouve (Firefox/Chrome/Chromium/Brave).",
+              file=sys.stderr)
         sys.exit(1)
-    return profile
+    return info
 
 
 def read_firefox_cookies(profile):
@@ -128,6 +215,100 @@ def read_firefox_cookies(profile):
             conn.close()
 
 
+def get_keyring_password(app):
+    try:
+        out = subprocess.check_output(
+            ["secret-tool", "lookup", "application", app],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    return out.decode("utf-8").strip() or None
+
+
+def decrypt_chromium_value(encrypted, host_key, keyring_password, has_integrity_prefix):
+    if not encrypted:
+        return ""
+    prefix = encrypted[:3]
+    if prefix == b"v10":
+        password = "peanuts"
+    elif prefix == b"v11":
+        if not keyring_password:
+            raise RuntimeError("Mot de passe keyring requis pour cookies v11")
+        password = keyring_password
+    else:
+        return encrypted.decode("utf-8", errors="replace")
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    body = encrypted[3:]
+    key = hashlib.pbkdf2_hmac("sha1", password.encode(), b"saltysalt", 1, 16)
+    cipher = Cipher(algorithms.AES(key), modes.CBC(b" " * 16))
+    decryptor = cipher.decryptor()
+    decrypted = decryptor.update(body) + decryptor.finalize()
+    pad = decrypted[-1]
+    payload = decrypted[:-pad]
+    if has_integrity_prefix:
+        expected = hashlib.sha256(host_key.encode()).digest()
+        if payload[:32] != expected:
+            raise RuntimeError("Integrity prefix mismatch")
+        payload = payload[32:]
+    return payload.decode("utf-8")
+
+
+def read_chromium_cookies(browser):
+    db = browser["db"]
+    if not db.exists():
+        return {}
+    keyring_password = get_keyring_password(browser["keyring"])
+    with tempfile.TemporaryDirectory(prefix="alexa-cookies-") as tmp:
+        copied = Path(tmp) / "Cookies"
+        try:
+            shutil.copy2(db, copied)
+        except OSError:
+            return {}
+        try:
+            conn = sqlite3.connect(f"file:{copied}?mode=ro", uri=True, timeout=5.0)
+        except sqlite3.Error:
+            return {}
+        try:
+            try:
+                row = conn.execute(
+                    "SELECT value FROM meta WHERE key = 'version'"
+                ).fetchone()
+                version = int(row[0]) if row else 0
+            except (sqlite3.Error, ValueError, TypeError):
+                version = 0
+            has_integrity_prefix = version >= 24
+            cur = conn.execute(
+                "SELECT host_key, name, encrypted_value FROM cookies "
+                "WHERE host_key LIKE '%amazon.fr' "
+                "ORDER BY last_access_utc DESC, expires_utc DESC"
+            )
+            cookies = {}
+            for host_key, name, enc in cur:
+                if name in cookies:
+                    continue
+                try:
+                    cookies[name] = decrypt_chromium_value(
+                        enc, host_key, keyring_password, has_integrity_prefix,
+                    )
+                except Exception:
+                    continue
+            return cookies
+        except sqlite3.Error:
+            return {}
+        finally:
+            conn.close()
+
+
+def read_browser_cookies(browser):
+    if browser["type"] == "firefox":
+        return read_firefox_cookies(browser["profile"])
+    if browser["type"] == "chromium":
+        return read_chromium_cookies(browser)
+    return {}
+
+
 def make_session(cookies):
     session = requests.Session()
     session.headers.update(HEADERS)
@@ -154,30 +335,31 @@ def cookies_are_valid(cookies):
     return resp.status_code == 200
 
 
-def auto_login(profile):
-    cookies = read_firefox_cookies(profile)
+def auto_login(browser):
+    cookies = read_browser_cookies(browser)
     if cookies_are_valid(cookies):
         return cookies
 
-    print("Authentification requise. Ouverture de Firefox...", file=sys.stderr)
+    print(f"Authentification requise. Ouverture de {browser['label']}...",
+          file=sys.stderr)
     try:
         subprocess.Popen(
-            ["firefox", ALEXA_URL + DEVICES_PATH],
+            [browser["command"], ALEXA_URL + DEVICES_PATH],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
     except FileNotFoundError:
-        print("Firefox introuvable dans le PATH.", file=sys.stderr)
+        print(f"{browser['label']} introuvable dans le PATH.", file=sys.stderr)
         sys.exit(1)
 
     print(
-        f"Connecte-toi a Amazon dans Firefox (timeout {LOGIN_TIMEOUT_SEC}s)...",
+        f"Connecte-toi a Amazon dans {browser['label']} (timeout {LOGIN_TIMEOUT_SEC}s)...",
         file=sys.stderr,
     )
     deadline = time.time() + LOGIN_TIMEOUT_SEC
     while time.time() < deadline:
         time.sleep(POLL_INTERVAL_SEC)
-        cookies = read_firefox_cookies(profile)
+        cookies = read_browser_cookies(browser)
         if cookies_are_valid(cookies):
             print("Connexion etablie.", file=sys.stderr)
             return cookies
@@ -187,14 +369,14 @@ def auto_login(profile):
 
 
 def authed_request(call):
-    profile = require_firefox_profile()
-    cookies = read_firefox_cookies(profile)
+    browser = require_browser()
+    cookies = read_browser_cookies(browser)
     if not cookies_look_complete(cookies):
-        cookies = auto_login(profile)
+        cookies = auto_login(browser)
     session = make_session(cookies)
     resp = call(session)
     if resp.status_code in (302, 401):
-        cookies = auto_login(profile)
+        cookies = auto_login(browser)
         session = make_session(cookies)
         resp = call(session)
     resp.raise_for_status()
@@ -303,8 +485,9 @@ def send_behavior(behavior_type, payload, device):
 # ── Commands ──────────────────────────────────────────────────────────
 
 def cmd_setup(_args):
-    profile = require_firefox_profile()
-    cookies = auto_login(profile)
+    browser = require_browser()
+    print(f"Navigateur detecte : {browser['label']}", file=sys.stderr)
+    cookies = auto_login(browser)
     if not cookies_are_valid(cookies):
         print("Cookies invalides apres login.", file=sys.stderr)
         sys.exit(1)

@@ -2,9 +2,11 @@
 
 Send text commands to Alexa devices from the command line, using Amazon's web API.
 
-Authentication is automatic: cookies are read live from your Firefox profile.
-When the session expires, Firefox is opened to the Amazon login page and the
-tool polls until you finish logging in — no copy/paste step.
+Authentication is automatic: the default web browser is detected
+(`xdg-settings get default-web-browser`), its session cookies are read live
+from disk, and on missing/expired session that browser is opened to the
+Amazon login page. The tool polls until you finish logging in — no copy/paste
+step.
 
 ## Usage
 
@@ -32,13 +34,16 @@ The first time you run any command, a Firefox tab opens on
 `https://alexa.amazon.fr/api/devices-v2/device`. Log in to Amazon — the tool
 detects the fresh cookies automatically and continues.
 
-## How auth works
+## Browser support
 
-- Cookies are read from `~/.mozilla/firefox/<profile>/cookies.sqlite` (the
-  install-default profile from `profiles.ini`).
-- Only unpartitioned cookies on `*amazon.fr` are used.
-- On HTTP 401/302, Firefox is reopened to the login URL and the tool polls
-  every 2s for up to 5 minutes.
+| Browser | Source |
+|---------|--------|
+| Firefox | `~/.mozilla/firefox/<profile>/cookies.sqlite` (unpartitioned cookies only) |
+| Chrome / Chromium / Brave | `~/.config/<browser>/Default/Cookies` (AES-128-CBC + PBKDF2-HMAC-SHA1, password from libsecret `Chrome Safe Storage`); on cookies DB version ≥ 24 the 32-byte SHA-256 host integrity prefix is stripped |
+
+If the detected default browser cannot be read (decryption fails or no
+cookies), the tool falls back to the next available browser. Polls every 2s
+for up to 5 minutes during auto-login.
 
 ## Configuration
 
@@ -53,7 +58,9 @@ Stored in `~/.config/alexa-cmd/`:
 
 - Python 3
 - `requests` library
-- Firefox (with at least one Amazon login already done in the profile)
+- One of: Firefox, Chrome, Chromium, Brave
+- `xdg-settings`, `xdg-utils` (for default-browser detection)
+- `cryptography` and `secret-tool` (only needed if using Chromium-family)
 
 ## Limitations
 
@@ -62,4 +69,8 @@ Stored in `~/.config/alexa-cmd/`:
   API endpoints still work.
 - `customerId` is required in the payload (extracted automatically from the
   device list).
-- Auto-login requires Firefox; other browsers are not supported.
+- Chromium has a newer `v12` scheme (AES-256-GCM with a key derived via the
+  XDG Secret Portal) that is bound to the Chrome process and cannot be
+  decrypted by other processes. Cookies encrypted as `v12` are skipped.
+  Tested on Chrome 148: cookies are still written as `v11` (libsecret), so
+  decryption works.
